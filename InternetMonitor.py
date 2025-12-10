@@ -1,13 +1,23 @@
 from Database import Database
-import speedtest, matplotlib
-import os, platform, subprocess, re, configparser, time
+from Reporting import Reporting
+import speedtest
+import os, subprocess, re, configparser, time, threading, datetime, io
 from plyer import notification
+from TCPMessenger import TCPMessenger
 class InternetMonitor:
     def __init__(self, db_name="internet_monitor.db", config_file="monitor.ini"):
+        self.reporting = Reporting(db_name)
         self.db = Database(db_name)
         self.config_file = config_file
         self.db.setup_db()
         self.config = self.load_config()
+        if __debug__:
+            self.messenger = TCPMessenger(self.config.get('TCPDebugSettings', 'host'), self.config.getint('TCPDebugSettings', 'port'))
+        else:
+            self.messenger = TCPMessenger(self.config.get('TCPSettings', 'host'), self.config.getint('TCPSettings', 'port'))
+        self.last_status = None
+        self.running = False
+        self.running_thread = None
 
     def load_config(self):
         config = configparser.ConfigParser()
@@ -79,13 +89,17 @@ class InternetMonitor:
             print(f"Error in speed_test: {e}")
             return None, None
         
-    def start_test(self, simple_test=False):
+    def start_test(self, simple_test=False, for_telegram=False):
+        builder = io.StringIO()
+        if not for_telegram:
+            builder.write(datetime.datetime.now().strftime("\n[%Y-%m-%d %H:%M:%S] - Starting internet test\n"))
         latency, packet_loss = self.ping_test()
-        print(f"Latency: {latency}ms, Packet Loss: {packet_loss}%")
+        builder.write("Speed Test:\n")
         download, upload = self.speed_test()
         if download is not None:
-            print(f"Download: {download:.2f} Mbps, Upload: {upload:.2f} Mbps")
+            builder.write(f" Download: {download:.2f} Mbps\n Upload: {upload:.2f} Mbps\n")
         
+        builder.write(f" Latency: {latency}ms\n Packet Loss: {packet_loss}%\n")
         status = 'online' if latency is not None and packet_loss < 100 else 'offline'
 
         if not simple_test:            
@@ -107,12 +121,29 @@ class InternetMonitor:
                     f"Current packet loss: {packet_loss:.1f}% (threshold: {packet_loss_threshold}%)"
                 )
             if download and download < low_download:
+                try:
+                    self.messenger.send_text("slow_internet")
+                except Exception as e:
+                    print(f"Error sending TCP message: {e}")
                 self.send_notification(
                     "⚠️ Slow Download Speed",
                     f"Current speed: {download:.1f} Mbps (threshold: {low_download} Mbps)"
                 )
         
         self.last_status = status
+        if for_telegram:
+            return builder.getvalue()
+        else:
+            print(builder.getvalue())
+
+    def start_continuous(self):
+        if not self.running:
+            self.running = True
+            self.running_thread = threading.Thread(target=self.run_continuous)
+            self.running_thread.start()
+            self.messenger.set_text_callback(self.on_message_received)
+            self.tcp_thread = threading.Thread(target=self.messenger.connect)
+            self.tcp_thread.start()
 
     def run_continuous(self):
         interval = self.config.getint('Settings', 'interval_minutes')
@@ -120,7 +151,8 @@ class InternetMonitor:
         print("Press Ctrl+C to stop")
         try:
             while True:
-                self.start_test()
+                if not __debug__:
+                    self.start_test()
                 time.sleep(interval * 60)
         except KeyboardInterrupt:
             print("\n\nMonitoring stopped manually.")
@@ -128,3 +160,21 @@ class InternetMonitor:
                 "🛑 Internet Monitor Stopped",
                 "Monitoring has been stopped"
             )
+
+    def on_message_received(self, message):
+        if message['type'] == 'text':
+            if message['title'] == 'speed_test_results_report':
+                content = self.reporting.generate_report(1, for_telegram=True)
+                self.messenger.send_text("speed_test_results_report", content, chatId=message['chatId'], messageId=message['messageId'])
+            elif message['title'] == 'speed_test_results_graph':
+                graph_path = self.reporting.plot_graphs(1, for_telegram=True)
+                self.messenger.send_image(graph_path, "speed_test_results_graph", chatId=message['chatId'], messageId=message['messageId'])
+            elif message['title'] == 'speed_test_start':
+                content = self.start_test(for_telegram=True, simple_test=True)
+                self.messenger.send_text("speed_test_start", content, chatId=message['chatId'], messageId=message['messageId'])
+
+    def generate_report(self, days=1):
+        print(self.reporting.generate_report(days))
+
+    def plot_graphs(self, days=1):
+        self.reporting.plot_graphs(days)
